@@ -1,0 +1,9 @@
+{
+  "setup.security.lynis": {
+    "icon": "󰒃",
+    "label": "Lynis",
+    "description": "Scan with Lynis, then fix findings: A all, N none, Y each one",
+    "when": "command -v lynis >/dev/null",
+    "action": "omarchy-launch-floating-terminal-with-presentation \"$HOME/.local/bin/omarchy-lynis-scan\""
+  }
+}

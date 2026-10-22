@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# Omarchy Lynis scan. Pick a scan mode, then choose which findings to fix:
+#   A  all automatic fixes
+#   N  none
+#   Y  ask for each one
+#
+# Lynis mostly reports hardening notes. This tool only applies a reviewed
+# action: a patched Arch package, NTP, the ufw firewall, or removing
+# other-write from a world-writable file under /etc. Everything else is shown
+# as a note and left alone.
+
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-lynis"
+REPORT="$STATE/report.dat"
+LOG="$STATE/lynis.log"
+APPLIED="$STATE/applied.log"
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' Y=$'\e[33m' G=$'\e[32m' C=$'\e[36m' Z=$'\e[0m'
+else
+  B= D= R= Y= G= C= Z=
+fi
+
+die() { printf '%s%s%s\n' "$R" "$*" "$Z" >&2; exit 1; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+# Areas passed to lynis --tests. The value must contain each full test id.
+area_prefix() {
+  case "$1" in
+    authentication) echo "AUTH-" ;;
+    boot) echo "BOOT-" ;;
+    crypto) echo "CRYP-" ;;
+    files) echo "FILE-" ;;
+    firewall) echo "FIRE-" ;;
+    hardening) echo "HRDN-" ;;
+    kernel) echo "KRNL-" ;;
+    logging) echo "LOGG-" ;;
+    malware) echo "MALW-" ;;
+    network) echo "NETW-" ;;
+    packages) echo "PKGS-" ;;
+    ssh) echo "SSH-" ;;
+    time) echo "TIME-" ;;
+    *) return 1 ;;
+  esac
+}
+
+area_tests() {
+  local prefix="$1" id tests=()
+  [[ -d /usr/share/lynis/include ]] || die "Lynis data is not in /usr/share/lynis/include"
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && tests+=("$id")
+  done < <(grep -Rho -- "--test-no ${prefix}[0-9][0-9]*" /usr/share/lynis/include | awk '{print $2}' | sort -u)
+  ((${#tests[@]})) || die "No Lynis tests for ${prefix}"
+  printf '%s\n' "${tests[*]}"
+}
+
+choose_mode() {
+  cat >&2 <<EOF
+${B}Lynis scan${Z}
+
+  ${C}1${Z}  Quick          whole system, no pauses
+  ${C}2${Z}  Step through   whole system, press Enter between sections
+  ${C}3${Z}  One area       authentication, kernel, ssh, firewall, ...
+  ${C}4${Z}  Pentest        unprivileged scan, points of interest
+  ${C}5${Z}  Last report    review the previous scan, do not scan again
+
+EOF
+  local reply
+  while true; do
+    read -r -p "Scan mode [1-5]: " reply
+    case "$reply" in
+      1) echo quick; return ;;
+      2) echo step; return ;;
+      3) echo area; return ;;
+      4) echo pentest; return ;;
+      5) echo last; return ;;
+      *) echo "Type a number from 1 to 5." >&2 ;;
+    esac
+  done
+}
+
+choose_area() {
+  local names=(authentication boot crypto files firewall hardening kernel logging malware network packages ssh time)
+  local i=1 name
+  echo >&2
+  echo "${B}Area${Z}" >&2
+  for name in "${names[@]}"; do
+    printf '  %s%2d%s  %s\n' "$C" "$i" "$Z" "$name" >&2
+    i=$((i + 1))
+  done
+  echo >&2
+  local reply
+  while true; do
+    read -r -p "Area [1-${#names[@]}]: " reply
+    if [[ "$reply" =~ ^[0-9]+$ ]] && ((reply >= 1 && reply <= ${#names[@]})); then
+      echo "${names[$((reply - 1))]}"
+      return
+    fi
+    echo "Type a number from 1 to ${#names[@]}." >&2
+  done
+}
+
+run_lynis() {
+  local mode="$1" area="${2:-}"
+  local -a args=(audit system --no-colors --report-file "$REPORT" --log-file "$LOG")
+  case "$mode" in
+    quick) args+=(--quick) ;;
+    step) args+=(--wait) ;;
+    area)
+      local prefix tests
+      prefix="$(area_prefix "$area")" || die "Unknown area: $area"
+      tests="$(area_tests "$prefix")"
+      args+=(--quick --tests "$tests")
+      ;;
+    pentest) args+=(--pentest --quick) ;;
+    *) die "Unknown scan mode: $mode" ;;
+  esac
+
+  echo
+  echo "${B}Running Lynis${Z} (${mode}${area:+ ${area}}). A full scan takes a few minutes."
+  echo
+  local status=0
+  if [[ "$mode" == pentest ]]; then
+    lynis "${args[@]}" || status=$?
+  else
+    sudo lynis "${args[@]}" || status=$?
+    sudo chown "$USER:$(id -gn)" "$REPORT" "$LOG" 2>/dev/null || true
+  fi
+  [[ -f "$REPORT" ]] || die "Lynis did not write a report (exit ${status})."
+  return 0
+}
+
+read_report() {
+  if [[ -r "$REPORT" ]]; then
+    cat -- "$REPORT"
+  elif [[ -f "$REPORT" ]]; then
+    sudo cat -- "$REPORT"
+  fi
+}
+
+# Print one record per line:
+# kind<TAB>key<TAB>title<TAB>detail<TAB>action
+# kind is "fix" or "note". action is empty for notes.
+collect_lynis() {
+  [[ -f "$REPORT" ]] || return 0
+  local line id msg details solution kind action title detail
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == warning\[\]=* || "$line" == suggestion\[\]=* ]] || continue
+    line="${line#*=}"
+    IFS='|' read -r id msg details solution _ <<<"$line"
+    [[ -n "$id" ]] || continue
+    kind=note
+    action=""
+    title="$id  $msg"
+    detail=""
+    msg="${msg//$'\t'/ }"
+    details="${details//$'\t'/ }"
+    solution="${solution//$'\t'/ }"
+    [[ -n "$details" && "$details" != "-" ]] && detail="$details"
+    [[ -n "$solution" && "$solution" != "-" ]] && detail="${detail:+$detail }($solution)"
+
+    case "$id" in
+      TIME-3104)
+        if timedatectl show -p NTP --value 2>/dev/null | grep -qx yes; then
+          :
+        else
+          kind=fix
+          action="ntp"
+          detail="Turn on systemd NTP (timedatectl set-ntp true)."
+        fi
+        ;;
+      FIRE-4590)
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n 1 | grep -qi inactive; then
+          kind=fix
+          action="ufw"
+          detail="Enable ufw. Incoming stays denied, outgoing stays allowed, existing allow rules stay."
+        fi
+        ;;
+    esac
+
+    if [[ "$kind" == note && "$msg" == *"world writable"* && "$details" == /* ]]; then
+      if safe_etc_file "$details"; then
+        kind=fix
+        action="chmod-ow:$details"
+        detail="Remove other-write from $details. Ownership and the rest of the mode stay."
+      fi
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$id" "$title" "$detail" "$action"
+  done < <(read_report)
+}
+
+safe_etc_file() {
+  local path="$1" real
+  [[ "$path" != *$'\n'* && "$path" =~ ^/etc/[A-Za-z0-9._+/-]+$ ]] || return 1
+  [[ -e "$path" && ! -L "$path" && -f "$path" ]] || return 1
+  real="$(realpath -e -- "$path" 2>/dev/null)" || return 1
+  [[ "$real" == /etc/* && "$real" != /etc ]] || return 1
+  # Other-write bit, any of the setuid/group/other execute positions aside:
+  # test the permission string's ninth character.
+  # %A is ten characters: type, then user/group/other. Other-write is the ninth mark.
+  [[ "$(stat -c %A -- "$real" 2>/dev/null)" == ????????w? ]] || return 1
+  return 0
+}
+
+collect_packages() {
+  command -v arch-audit >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local raw
+  raw="$(arch-audit --json 2>/dev/null)" || return 0
+  [[ -n "$raw" ]] || return 0
+  printf '%s' "$raw" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+rank = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Unknown": 4}
+rows = []
+for item in data:
+    sev = item.get("severity") or "Unknown"
+    name = item.get("name") or ""
+    fixed = item.get("fixed")
+    issues = item.get("issues") or []
+    cve = ", ".join(issues[:3])
+    if len(issues) > 3:
+        cve += f" (+{len(issues) - 3})"
+    for pkg in item.get("packages") or []:
+        if not pkg or any(c.isspace() for c in pkg):
+            continue
+        rows.append((rank.get(sev, 9), sev, pkg, name, fixed, cve))
+rows.sort()
+for _, sev, pkg, name, fixed, cve in rows:
+    detail = f"{sev}. {name}."
+    if cve:
+        detail += f" {cve}."
+    if fixed:
+        print(f"fix\tpkg:{pkg}\t{pkg}  patched package is available\t{detail} Upgrade {pkg}.\tpacman:{pkg}")
+    else:
+        print(f"note\tpkg:{pkg}\t{pkg}  known issue, no patched package yet\t{detail}\t")
+'
+}
+
+hardening_index() {
+  [[ -f "$REPORT" ]] || return 0
+  local line
+  line="$(read_report | grep -m1 '^hardening_index=' || true)"
+  [[ -n "$line" ]] && printf '%s\n' "${line#hardening_index=}"
+}
+
+apply_action() {
+  local action="$1"
+  case "$action" in
+    ntp)
+      if timedatectl show -p NTP --value 2>/dev/null | grep -qx yes; then
+        echo "NTP is already on."
+        return 0
+      fi
+      sudo timedatectl set-ntp true
+      ;;
+    ufw)
+      command -v ufw >/dev/null 2>&1 || die "ufw is not installed."
+      if ufw status | head -n 1 | grep -qi active; then
+        echo "ufw is already active."
+        return 0
+      fi
+      sudo ufw default deny incoming
+      sudo ufw default allow outgoing
+      sudo ufw --force enable
+      ;;
+    chmod-ow:*)
+      local path="${action#chmod-ow:}"
+      safe_etc_file "$path" || die "Refusing to change permissions on $path"
+      sudo chmod o-w -- "$path"
+      ;;
+    pacman:*)
+      local pkg="${action#pacman:}"
+      [[ "$pkg" =~ ^[a-zA-Z0-9@._+-]+$ ]] || die "Refusing package name: $pkg"
+      sudo pacman -S --needed --noconfirm -- "$pkg"
+      ;;
+    *)
+      die "No action for $action"
+      ;;
+  esac
+}
+
+confirm_all() {
+  local n="$1"
+  local reply
+  echo
+  read -r -p "Apply these ${n} fixes? [y/N] " reply
+  [[ "${reply,,}" == y || "${reply,,}" == yes ]]
+}
+
+prompt_fix_mode() {
+  local reply
+  echo >&2
+  echo "${B}Fix findings?${Z}" >&2
+  echo "  ${C}A${Z}  all automatic fixes" >&2
+  echo "  ${C}N${Z}  none" >&2
+  echo "  ${C}Y${Z}  ask for each one" >&2
+  echo >&2
+  while true; do
+    read -r -p "[A/N/Y]: " reply
+    case "${reply^^}" in
+      A) echo all; return ;;
+      N) echo none; return ;;
+      Y) echo each; return ;;
+      *) echo "Type A, N, or Y." >&2 ;;
+    esac
+  done
+}
+
+record_applied() {
+  mkdir -p "$STATE"
+  printf '%s %s\n' "$(date -Is)" "$1" >>"$APPLIED"
+}
+
+review() {
+  local include_packages="${1:-yes}"
+  local collected index fixes=0 notes=0
+  local -a fix_title=() fix_detail=() fix_action=()
+  index="$(hardening_index || true)"
+  echo
+  echo "${B}Results${Z}"
+  [[ -n "$index" ]] && echo "Lynis hardening index: ${B}${index}${Z}"
+  echo
+
+  if [[ "$include_packages" == yes ]]; then
+    collected="$( { collect_lynis; collect_packages; } )"
+  else
+    collected="$(collect_lynis)"
+  fi
+  if [[ -z "$collected" ]]; then
+    echo "No warnings, suggestions, or package advisories."
+    return 0
+  fi
+
+  local kind key title detail action
+  while IFS=$'\t' read -r kind key title detail action; do
+    [[ -n "${kind:-}" ]] || continue
+    if [[ "$kind" == fix ]]; then
+      fixes=$((fixes + 1))
+      fix_title+=("$title")
+      fix_detail+=("$detail")
+      fix_action+=("$action")
+      printf '%s[fix %d]%s %s\n' "$G" "$fixes" "$Z" "$title"
+      [[ -n "$detail" ]] && printf '         %s\n' "$detail"
+    else
+      notes=$((notes + 1))
+      printf '%s[note]%s %s\n' "$D" "$Z" "$title"
+      [[ -n "$detail" ]] && printf '        %s%s%s\n' "$D" "$detail" "$Z"
+    fi
+  done <<<"$collected"
+
+  echo
+  echo "${fixes} automatic fix(es). ${notes} note(s) with no automatic fix."
+  if ((fixes == 0)); then
+    echo "Nothing in this report has a reviewed automatic fix."
+    return 0
+  fi
+
+  local mode
+  mode="$(prompt_fix_mode)"
+  [[ "$mode" == none ]] && return 0
+
+  local -a chosen=()
+  local i reply
+  if [[ "$mode" == all ]]; then
+    echo
+    echo "${B}These fixes will run${Z}"
+    for i in "${!fix_title[@]}"; do
+      printf '  %d. %s\n' "$((i + 1))" "${fix_title[$i]}"
+      [[ -n "${fix_detail[$i]}" ]] && printf '     %s\n' "${fix_detail[$i]}"
+    done
+    confirm_all "$fixes" || return 0
+    chosen=("${!fix_action[@]}")
+  else
+    for i in "${!fix_title[@]}"; do
+      echo
+      printf '%s[%d/%d]%s %s\n' "$B" "$((i + 1))" "$fixes" "$Z" "${fix_title[$i]}"
+      [[ -n "${fix_detail[$i]}" ]] && printf '%s\n' "${fix_detail[$i]}"
+      while true; do
+        read -r -p "Apply this fix? [y]es  [n]o  [a]ll remaining  [q]uit: " reply
+        case "${reply,,}" in
+          y|yes) chosen+=("$i"); break ;;
+          n|no|"") break ;;
+          a|all)
+            local j
+            for ((j = i; j < fixes; j++)); do chosen+=("$j"); done
+            break 2
+            ;;
+          q|quit) break 2 ;;
+          *) echo "Type y, n, a, or q." ;;
+        esac
+      done
+    done
+  fi
+
+  ((${#chosen[@]})) || return 0
+  echo
+  sudo -v || die "sudo is required to apply fixes."
+  for i in "${chosen[@]}"; do
+    echo "${B}Applying${Z} ${fix_title[$i]}"
+    if apply_action "${fix_action[$i]}"; then
+      record_applied "${fix_action[$i]}"
+      echo "${G}done${Z}"
+    else
+      echo "${R}failed${Z}: ${fix_title[$i]}" >&2
+    fi
+  done
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+Usage: omarchy-lynis-scan
+
+Scan this machine with Lynis, then choose what to fix.
+
+  A  apply every automatic fix, after a confirmation list
+  N  apply nothing
+  Y  ask for each automatic fix
+
+Notes are printed and never changed. A log of applied actions is kept at
+$APPLIED
+EOF
+      return 0
+      ;;
+  esac
+
+  need lynis
+  mkdir -p "$STATE"
+
+  local mode area=""
+  mode="$(choose_mode)"
+  if [[ "$mode" == area ]]; then
+    area="$(choose_area)"
+  fi
+  if [[ "$mode" == last ]]; then
+    [[ -f "$REPORT" ]] || die "No previous report at $REPORT"
+  else
+    run_lynis "$mode" "$area"
+  fi
+  if [[ "$mode" == area || "$mode" == pentest ]]; then
+    review no
+  else
+    review yes
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
