@@ -1,6 +1,6 @@
 # Omarchy Lynis addon
 
-Scan Omarchy machine with Lynis from **Setup → Security → Lynis**, then choose what to fix.
+Scan this Omarchy machine with Lynis from **Setup → Security → Lynis**, then choose what to fix.
 
 ## Install
 
@@ -26,9 +26,9 @@ You can also run `omarchy-lynis-scan` in a terminal. Scans other than Pentest as
 
 After the scan:
 
-- **A** applies every automatic fix, after showing the list
+- **A** applies every reviewed automatic fix, after showing the list and why the rest stay notes
 - **N** applies nothing
-- **Y** asks for each one. Inside that prompt, **a** applies the rest and **q** stops
+- **Y** asks for each one. Inside that prompt, **a** applies the remaining fixes and **q** stops
 
 Automatic fixes are only:
 
@@ -36,7 +36,16 @@ Automatic fixes are only:
 - turning NTP on, when it is off
 - enabling ufw, when it is installed but inactive
 - removing other-write from a world-writable file under `/etc`
+- the reviewed sysctl values, in `/etc/sysctl.d/99-omarchy-lynis.conf`
+- blocking `dccp`, `sctp`, `rds`, `tipc`, and firewire storage, in `/etc/modprobe.d/99-omarchy-lynis.conf`
+- a short authorized-use notice appended to `/etc/issue`
+- `127.0.1.1 <hostname>` in `/etc/hosts` when the hostname is missing
+- `* soft core 0` and `* hard core 0` in `/etc/security/limits.d/99-omarchy-lynis.conf`
 
-Other Lynis findings are printed as notes and left unchanged. That includes SSH settings, sysctls, and package advisories that do not have a patched package yet.
+USB storage, compilers, password aging, kernel-module lockdown, SysRq, IP forwarding, one-way BPF, new scanners or accounting services, and advisories with no patched package stay notes. Choosing A prints the reason for each of those.
 
 Applied actions are logged at `~/.local/state/omarchy-lynis/applied.log`.
+
+## Features
+
+Planned work lives in [Features](Features/). Each item has its own folder. The list started in `bin/plans.md`.

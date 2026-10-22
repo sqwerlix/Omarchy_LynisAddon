@@ -4,10 +4,12 @@
 #   N  none
 #   Y  ask for each one
 #
-# Lynis mostly reports hardening notes. This tool only applies a reviewed
-# action: a patched Arch package, NTP, the ufw firewall, or removing
-# other-write from a world-writable file under /etc. Everything else is shown
-# as a note and left alone.
+# Reviewed actions only. Everything else is a note, with a reason.
+# Fixes: patched Arch package, NTP, inactive ufw, other-write under /etc,
+# a short legal banner, the hostname in /etc/hosts, core-dump limits,
+# blocking dccp/sctp/rds/tipc and firewire storage, and the sysctl allowlist
+# in sysctl_safe_value. Not applied: USB storage, compilers, password aging,
+# module lockdown, SysRq, IP forwarding, or one-way BPF.
 
 set -uo pipefail
 
@@ -15,6 +17,9 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-lynis"
 REPORT="$STATE/report.dat"
 LOG="$STATE/lynis.log"
 APPLIED="$STATE/applied.log"
+SYSCTL_FILE=/etc/sysctl.d/99-omarchy-lynis.conf
+MODPROBE_FILE=/etc/modprobe.d/99-omarchy-lynis.conf
+LIMITS_FILE=/etc/security/limits.d/99-omarchy-lynis.conf
 
 if [[ -t 1 ]]; then
   B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' Y=$'\e[33m' G=$'\e[32m' C=$'\e[36m' Z=$'\e[0m'
@@ -22,7 +27,28 @@ else
   B= D= R= Y= G= C= Z=
 fi
 
-die() { printf '%s%s%s\n' "$R" "$*" "$Z" >&2; exit 1; }
+die() { printf '%s%s%s\n' "$R" "$*" "$Z" >/dev/tty; exit 1; }
+
+# The menu launcher can leave stdout pointing somewhere the user never sees.
+# Prompts and questions go straight to the terminal.
+say() {
+  if [[ -w /dev/tty ]]; then
+    printf '%s\n' "$*" >/dev/tty
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
+ask() {
+  local reply
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s' "$1" >/dev/tty
+    IFS= read -r reply </dev/tty || true
+  else
+    printf '%s' "$1" >&2
+    IFS= read -r reply || true
+  fi
+  printf '%s\n' "$reply"
+}
 
 need() {
   command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
@@ -59,26 +85,24 @@ area_tests() {
 }
 
 choose_mode() {
-  cat >&2 <<EOF
-${B}Lynis scan${Z}
-
-  ${C}1${Z}  Quick          whole system, no pauses
-  ${C}2${Z}  Step through   whole system, press Enter between sections
-  ${C}3${Z}  One area       authentication, kernel, ssh, firewall, ...
-  ${C}4${Z}  Pentest        unprivileged scan, points of interest
-  ${C}5${Z}  Last report    review the previous scan, do not scan again
-
-EOF
+  say "${B}Lynis scan${Z}"
+  say ""
+  say "  ${C}1${Z}  Quick          whole system, no pauses"
+  say "  ${C}2${Z}  Step through   whole system, press Enter between sections"
+  say "  ${C}3${Z}  One area       authentication, kernel, ssh, firewall, ..."
+  say "  ${C}4${Z}  Pentest        unprivileged scan, points of interest"
+  say "  ${C}5${Z}  Last report    review the previous scan, do not scan again"
+  say ""
   local reply
   while true; do
-    read -r -p "Scan mode [1-5]: " reply
+    reply="$(ask "Scan mode [1-5]: ")"
     case "$reply" in
       1) echo quick; return ;;
       2) echo step; return ;;
       3) echo area; return ;;
       4) echo pentest; return ;;
       5) echo last; return ;;
-      *) echo "Type a number from 1 to 5." >&2 ;;
+      *) say "Type a number from 1 to 5." ;;
     esac
   done
 }
@@ -86,21 +110,21 @@ EOF
 choose_area() {
   local names=(authentication boot crypto files firewall hardening kernel logging malware network packages ssh time)
   local i=1 name
-  echo >&2
-  echo "${B}Area${Z}" >&2
+  say ""
+  say "${B}Area${Z}"
   for name in "${names[@]}"; do
-    printf '  %s%2d%s  %s\n' "$C" "$i" "$Z" "$name" >&2
+    say "  ${C}${i}${Z}  ${name}"
     i=$((i + 1))
   done
-  echo >&2
+  say ""
   local reply
   while true; do
-    read -r -p "Area [1-${#names[@]}]: " reply
+    reply="$(ask "Area [1-${#names[@]}]: ")"
     if [[ "$reply" =~ ^[0-9]+$ ]] && ((reply >= 1 && reply <= ${#names[@]})); then
       echo "${names[$((reply - 1))]}"
       return
     fi
-    echo "Type a number from 1 to ${#names[@]}." >&2
+    say "Type a number from 1 to ${#names[@]}."
   done
 }
 
@@ -120,9 +144,9 @@ run_lynis() {
     *) die "Unknown scan mode: $mode" ;;
   esac
 
-  echo
-  echo "${B}Running Lynis${Z} (${mode}${area:+ ${area}}). A full scan takes a few minutes."
-  echo
+  say ""
+  say "${B}Running Lynis${Z} (${mode}${area:+ ${area}}). A full scan takes a few minutes."
+  say ""
   local status=0
   if [[ "$mode" == pentest ]]; then
     lynis "${args[@]}" || status=$?
@@ -142,13 +166,254 @@ read_report() {
   fi
 }
 
+blob_field() {
+  local blob="$1" want="$2" part
+  local IFS=';'
+  local -a parts=()
+  read -ra parts <<<"$blob"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == "$want:"* ]]; then
+      printf '%s\n' "${part#"$want:"}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Values Lynis asks for that are safe to set on this workstation.
+# The apply step refuses any key or value outside this list.
+sysctl_safe_value() {
+  case "$1" in
+    dev.tty.ldisc_autoload) echo 0 ;;
+    fs.protected_fifos) echo 2 ;;
+    fs.protected_regular) echo 2 ;;
+    fs.suid_dumpable) echo 0 ;;
+    kernel.kptr_restrict) echo 2 ;;
+    net.core.bpf_jit_harden) echo 2 ;;
+    net.ipv4.conf.all.log_martians) echo 1 ;;
+    net.ipv4.conf.default.log_martians) echo 1 ;;
+    net.ipv4.conf.all.send_redirects) echo 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Used when the live value is root-only, so a second pass over the same report
+# does not offer a value this script already wrote.
+sysctl_already_configured() {
+  local key="$1" value="$2" escaped
+  [[ -f "$SYSCTL_FILE" ]] || return 1
+  escaped="${key//./\\.}"
+  grep -Eq "^[[:space:]]*${escaped}[[:space:]]*=[[:space:]]*${value}[[:space:]]*$" "$SYSCTL_FILE"
+}
+
+sysctl_effect() {
+  case "$1" in
+    dev.tty.ldisc_autoload) echo "Unprivileged users cannot load TTY line disciplines." ;;
+    fs.protected_fifos) echo "In a sticky directory, only the owner can write to a FIFO." ;;
+    fs.protected_regular) echo "In a sticky directory, only the owner can write to an existing file." ;;
+    fs.suid_dumpable) echo "Setuid programs do not write core dumps." ;;
+    kernel.kptr_restrict) echo "Kernel addresses stay hidden." ;;
+    net.core.bpf_jit_harden) echo "BPF JIT hardening applies to every user." ;;
+    net.ipv4.conf.all.log_martians|net.ipv4.conf.default.log_martians)
+      echo "The kernel logs packets with an impossible source address."
+      ;;
+    net.ipv4.conf.all.send_redirects) echo "This host stops sending ICMP redirects." ;;
+    *) echo "Reviewed sysctl change." ;;
+  esac
+}
+
+sysctl_skip_reason() {
+  local field="$1" prefval="$2" current="$3"
+  case "$field" in
+    kernel.modules_disabled)
+      echo "Stays ${current}. Setting ${field}=${prefval} blocks new kernel modules until reboot."
+      ;;
+    kernel.sysrq)
+      echo "Stays ${current}. Setting ${field}=${prefval} turns off the recovery keys."
+      ;;
+    kernel.unprivileged_bpf_disabled)
+      echo "Stays ${current}. Unprivileged BPF is already off, and ${prefval} cannot be turned back until reboot."
+      ;;
+    net.ipv4.conf.all.forwarding)
+      echo "Stays ${current}. This is IP forwarding, which Docker and virtual machines use."
+      ;;
+    *)
+      echo "Stays ${current}. ${field}=${prefval} is not in the reviewed set."
+      ;;
+  esac
+}
+
+banner_needs_notice() {
+  local file=/etc/issue item count=0
+  local words=(audit access authori condition connect consent continu criminal enforce evidence forbidden intrusion law legal legislat log monitor owner penal policy policies privacy private prohibited prosecute record report restricted secure subject system terms warning)
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  for item in "${words[@]}"; do
+    grep -qi -- "$item" "$file" && count=$((count + 1))
+  done
+  ((count <= 4))
+}
+
+hosts_needs_name() {
+  local host
+  host="$(hostname 2>/dev/null || true)"
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*)$ ]] || return 1
+  [[ -f /etc/hosts ]] || return 1
+  if grep -E -v '^(#|$|^::1[[:space:]]|localhost)' /etc/hosts | grep -qiF -- "$host"; then
+    return 1
+  fi
+  return 0
+}
+
+# Lynis accepts the last "* hard core 0" or "* - core 0" in limits.conf and limits.d.
+core_hard_disabled() {
+  local last
+  last="$(awk '
+    $1 == "*" && $2 == "hard" && $3 == "core" { v = $4 }
+    $1 == "*" && $2 == "-" && $3 == "core" { v = $4 }
+    END { print v }
+  ' /etc/security/limits.conf /etc/security/limits.d/* 2>/dev/null || true)"
+  [[ "$last" == "0" ]]
+}
+
+modprobe_install_blocked() {
+  local proto="$1"
+  grep -Eqs "^install[[:space:]]+${proto}[[:space:]]+/bin/(true|false)$" /etc/modprobe.conf /etc/modprobe.d/* 2>/dev/null
+}
+
+firewire_blocked() {
+  grep -Ehs 'blacklist (ohci1394|firewire[-_]ohci|firewire-core)|install (ohci1394|firewire[-_]ohci|firewire-core) /bin/(false|true)' \
+    /etc/modprobe.conf /etc/modprobe.d/* 2>/dev/null | grep -qv '#'
+}
+
+emit_krnl_sysctls() {
+  local line id service blob field prefval value current expected
+  for line in "$@"; do
+    line="${line#*=}"
+    IFS='|' read -r id service blob _ <<<"$line"
+    field="$(blob_field "$blob" field || true)"
+    prefval="$(blob_field "$blob" prefval || true)"
+    value="$(blob_field "$blob" value || true)"
+    [[ -n "$field" && "$prefval" =~ ^[0-9]+$ ]] || continue
+    local readable=0
+    if current="$(sysctl -n "$field" 2>/dev/null)"; then
+      readable=1
+    else
+      current="$value"
+    fi
+    if ((readable)) && [[ "$current" == "$prefval" ]]; then
+      continue
+    fi
+    if ((readable == 0)) && sysctl_already_configured "$field" "$prefval"; then
+      continue
+    fi
+    if expected="$(sysctl_safe_value "$field")" && [[ "$expected" == "$prefval" ]]; then
+      printf 'fix\tKRNL-6000:%s\tKRNL-6000  %s\tSet %s from %s to %s. %s\tsysctl:%s=%s\n' \
+        "$field" "$field" "$field" "$current" "$prefval" "$(sysctl_effect "$field")" "$field" "$prefval"
+    else
+      printf 'note\tKRNL-6000:%s\tKRNL-6000  %s\t%s\t\n' \
+        "$field" "$field" "$(sysctl_skip_reason "$field" "$prefval" "$current")"
+    fi
+  done
+}
+
+# Why a finding stays a note. One line, grouped when several findings share it.
+skip_reason() {
+  local key="$1"
+  case "$key" in
+    KRNL-6000:kernel.modules_disabled)
+      echo "kernel.modules_disabled stays off. Setting it to 1 blocks new kernel modules until reboot."
+      ;;
+    KRNL-6000:kernel.sysrq)
+      echo "kernel.sysrq stays as it is, so the recovery keys keep working."
+      ;;
+    KRNL-6000:kernel.unprivileged_bpf_disabled)
+      echo "Unprivileged BPF is already off. The profile value cannot be turned back until reboot."
+      ;;
+    KRNL-6000:net.ipv4.conf.all.forwarding)
+      echo "IP forwarding stays on for Docker and virtual machines."
+      ;;
+    KRNL-6000:*)
+      echo "That sysctl is outside the reviewed set."
+      ;;
+    USB-1000)
+      echo "USB storage stays available, so disks and installers keep working."
+      ;;
+    HRDN-7222)
+      echo "Compilers stay usable on this machine."
+      ;;
+    AUTH-9229|AUTH-9230|AUTH-9286|AUTH-9328)
+      echo "Password aging, hashing rounds, and the login umask stay as they are."
+      ;;
+    FILE-6310)
+      echo "Moving /var onto its own partition is a disk layout change."
+      ;;
+    FILE-6336)
+      echo "Swap mount options stay as they are."
+      ;;
+    FILE-6394)
+      echo "Swappiness stays at its current value."
+      ;;
+    FILE-7524)
+      echo "Lynis did not name the files to change."
+      ;;
+    BOOT-5264)
+      echo "Service hardening is per service, not one switch."
+      ;;
+    NAME-4028)
+      echo "The DNS domain needs a name you choose."
+      ;;
+    LOGG-2154)
+      echo "There is no external log host to send logs to."
+      ;;
+    LOGG-2190)
+      echo "Deleted files that are still open need a look, not a blind delete."
+      ;;
+    CRYP-7902)
+      echo "Certificate expiry needs a look, not a rewrite."
+      ;;
+    TOOL-5002)
+      echo "No management tool is required on this workstation."
+      ;;
+    FINT-4350)
+      echo "A file integrity tool is a new install and a database build."
+      ;;
+    HRDN-7230)
+      echo "A malware scanner is a new install, not applied automatically."
+      ;;
+    ACCT-9622)
+      echo "Process accounting is a new package and a running service."
+      ;;
+    ACCT-9626)
+      echo "sysstat is a new package and a timer."
+      ;;
+    ACCT-9628)
+      echo "audit is installed. Starting auditd is a separate choice."
+      ;;
+    PKGS-7398)
+      echo "arch-audit is already installed. Lynis does not treat Omarchy as Arch Linux, so it does not count it."
+      ;;
+    PKGS-7322|pkg:*)
+      echo "These packages have no patched Arch package yet."
+      ;;
+    *)
+      echo "No reviewed automatic action."
+      ;;
+  esac
+}
+
 # Print one record per line:
 # kind<TAB>key<TAB>title<TAB>detail<TAB>action
 # kind is "fix" or "note". action is empty for notes.
 collect_lynis() {
   [[ -f "$REPORT" ]] || return 0
-  local line id msg details solution kind action title detail
+  local line id msg details solution kind action title detail proto
+  local -a krnl_details=()
+  local krnl_pending=0
   while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == details\[\]=KRNL-6000\|* ]]; then
+      krnl_details+=("$line")
+      continue
+    fi
     [[ "$line" == warning\[\]=* || "$line" == suggestion\[\]=* ]] || continue
     line="${line#*=}"
     IFS='|' read -r id msg details solution _ <<<"$line"
@@ -157,6 +422,7 @@ collect_lynis() {
     action=""
     title="$id  $msg"
     detail=""
+    proto=""
     msg="${msg//$'\t'/ }"
     details="${details//$'\t'/ }"
     solution="${solution//$'\t'/ }"
@@ -180,6 +446,52 @@ collect_lynis() {
           detail="Enable ufw. Incoming stays denied, outgoing stays allowed, existing allow rules stay."
         fi
         ;;
+      KRNL-5820)
+        if [[ "$msg" == *limits.conf* ]] && ! core_hard_disabled; then
+          kind=fix
+          action="limits-core"
+          detail="Write * soft core 0 and * hard core 0 in /etc/security/limits.d. New logins cannot write core dumps. This login keeps its current limit."
+        fi
+        ;;
+      NETW-3200)
+        if [[ "$msg" =~ protocol\ \'([a-z0-9_-]+)\' ]]; then
+          proto="${BASH_REMATCH[1]}"
+        fi
+        case "$proto" in
+          dccp|sctp|rds|tipc)
+            if modprobe_install_blocked "$proto"; then
+              detail="Already blocked from loading."
+            else
+              kind=fix
+              action="modprobe-false:$proto"
+              detail="Stop the ${proto} module from loading. A module that is already loaded stays loaded until reboot."
+            fi
+            ;;
+        esac
+        ;;
+      STRG-1846)
+        if firewire_blocked; then
+          detail="Firewire storage is already blocked."
+        else
+          kind=fix
+          action="modprobe-false:firewire-core"
+          detail="Stop firewire storage modules from loading. A module that is already loaded stays loaded until reboot."
+        fi
+        ;;
+      BANN-7126)
+        if banner_needs_notice; then
+          kind=fix
+          action="banner-issue"
+          detail="Append a short authorized-use notice to /etc/issue. The current line stays."
+        fi
+        ;;
+      NAME-4404)
+        if hosts_needs_name; then
+          kind=fix
+          action="hosts-name"
+          detail="Add 127.0.1.1 $(hostname) to /etc/hosts. The localhost lines stay."
+        fi
+        ;;
     esac
 
     if [[ "$kind" == note && "$msg" == *"world writable"* && "$details" == /* ]]; then
@@ -190,8 +502,25 @@ collect_lynis() {
       fi
     fi
 
+    if [[ "$id" == KRNL-6000 ]]; then
+      krnl_pending=0
+      if ((${#krnl_details[@]})); then
+        emit_krnl_sysctls "${krnl_details[@]}"
+        krnl_details=()
+      else
+        krnl_pending=1
+      fi
+      continue
+    fi
+
     printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$id" "$title" "$detail" "$action"
   done < <(read_report)
+
+  if ((${#krnl_details[@]})); then
+    emit_krnl_sysctls "${krnl_details[@]}"
+  elif ((krnl_pending)); then
+    printf 'note\tKRNL-6000\tKRNL-6000  One or more sysctl values differ\tThe report did not list the sysctl keys.\t\n'
+  fi
 }
 
 safe_etc_file() {
@@ -200,8 +529,6 @@ safe_etc_file() {
   [[ -e "$path" && ! -L "$path" && -f "$path" ]] || return 1
   real="$(realpath -e -- "$path" 2>/dev/null)" || return 1
   [[ "$real" == /etc/* && "$real" != /etc ]] || return 1
-  # Other-write bit, any of the setuid/group/other execute positions aside:
-  # test the permission string's ninth character.
   # %A is ten characters: type, then user/group/other. Other-write is the ninth mark.
   [[ "$(stat -c %A -- "$real" 2>/dev/null)" == ????????w? ]] || return 1
   return 0
@@ -279,6 +606,79 @@ apply_action() {
       [[ "$pkg" =~ ^[a-zA-Z0-9@._+-]+$ ]] || die "Refusing package name: $pkg"
       sudo pacman -S --needed --noconfirm -- "$pkg"
       ;;
+    sysctl:*)
+      local spec="${action#sysctl:}" key value expected escaped file tmp status
+      [[ "$spec" == *=* ]] || die "Refusing sysctl $spec"
+      key="${spec%%=*}"
+      value="${spec#*=}"
+      expected="$(sysctl_safe_value "$key" || true)"
+      [[ -n "$expected" && "$value" == "$expected" ]] || die "Refusing sysctl ${key}=${value}"
+      file="$SYSCTL_FILE"
+      tmp="$(mktemp)"
+      if [[ -f "$file" ]]; then
+        escaped="${key//./\\.}"
+        sudo cat -- "$file" | grep -vE "^[[:space:]]*${escaped}[[:space:]]*=" >"$tmp" || true
+      fi
+      if ! grep -q 'omarchy-lynis-scan' "$tmp"; then
+        printf '%s\n' '# Reviewed sysctls from omarchy-lynis-scan.' >>"$tmp"
+      fi
+      printf '%s = %s\n' "$key" "$value" >>"$tmp"
+      sudo tee "$file" <"$tmp" >/dev/null
+      status=$?
+      rm -f "$tmp"
+      [[ "$status" -eq 0 ]] || return "$status"
+      sudo sysctl -w "${key}=${value}"
+      ;;
+    modprobe-false:*)
+      local proto="${action#modprobe-false:}" line
+      case "$proto" in
+        dccp|sctp|rds|tipc|firewire-core) ;;
+        *) die "Refusing module $proto" ;;
+      esac
+      if modprobe_install_blocked "$proto" || { [[ "$proto" == firewire-core ]] && firewire_blocked; }; then
+        echo "$proto is already blocked."
+        return 0
+      fi
+      line="install ${proto} /bin/false"
+      if [[ ! -f "$MODPROBE_FILE" ]]; then
+        printf '%s\n' '# Reviewed module blocks from omarchy-lynis-scan.' | sudo tee "$MODPROBE_FILE" >/dev/null
+      fi
+      printf '%s\n' "$line" | sudo tee -a "$MODPROBE_FILE" >/dev/null
+      ;;
+    banner-issue)
+      local banner=/etc/issue
+      [[ -f "$banner" && ! -L "$banner" ]] || die "Refusing to change $banner"
+      if ! banner_needs_notice; then
+        echo "The login banner already has a legal notice."
+        return 0
+      fi
+      if grep -q 'omarchy-lynis-banner' "$banner"; then
+        echo "Banner text is already present."
+        return 0
+      fi
+      printf '\n%s\n' '# omarchy-lynis-banner' \
+        'Authorized use only. Unauthorized access to this system is prohibited.' \
+        'Use of this system is monitored and may be subject to legal action.' | sudo tee -a "$banner" >/dev/null
+      ;;
+    hosts-name)
+      local host line
+      host="$(hostname 2>/dev/null || true)"
+      [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*)$ ]] || die "Refusing hostname: $host"
+      if ! hosts_needs_name; then
+        echo "Hostname is already in /etc/hosts."
+        return 0
+      fi
+      line="127.0.1.1 ${host}"
+      printf '%s\n' "$line" | sudo tee -a /etc/hosts >/dev/null
+      ;;
+    limits-core)
+      if core_hard_disabled; then
+        echo "Core dumps are already disabled in limits."
+        return 0
+      fi
+      sudo mkdir -p /etc/security/limits.d
+      printf '%s\n' '# omarchy-lynis: no core dumps for new logins' '* soft core 0' '* hard core 0' | sudo tee "$LIMITS_FILE" >/dev/null
+      ;;
     *)
       die "No action for $action"
       ;;
@@ -286,28 +686,26 @@ apply_action() {
 }
 
 confirm_all() {
-  local n="$1"
-  local reply
-  echo
-  read -r -p "Apply these ${n} fixes? [y/N] " reply
+  local n="$1" reply
+  reply="$(ask "Apply these ${n} fixes? [y/N] ")"
   [[ "${reply,,}" == y || "${reply,,}" == yes ]]
 }
 
 prompt_fix_mode() {
   local reply
-  echo >&2
-  echo "${B}Fix findings?${Z}" >&2
-  echo "  ${C}A${Z}  all automatic fixes" >&2
-  echo "  ${C}N${Z}  none" >&2
-  echo "  ${C}Y${Z}  ask for each one" >&2
-  echo >&2
+  say ""
+  say "${B}Fix findings?${Z}"
+  say "  ${C}A${Z}  all automatic fixes"
+  say "  ${C}N${Z}  none"
+  say "  ${C}Y${Z}  ask for each one"
+  say ""
   while true; do
-    read -r -p "[A/N/Y]: " reply
+    reply="$(ask "[A/N/Y]: ")"
     case "${reply^^}" in
       A) echo all; return ;;
       N) echo none; return ;;
       Y) echo each; return ;;
-      *) echo "Type A, N, or Y." >&2 ;;
+      *) say "Type A, N, or Y." ;;
     esac
   done
 }
@@ -317,15 +715,36 @@ record_applied() {
   printf '%s %s\n' "$(date -Is)" "$1" >>"$APPLIED"
 }
 
+say_note_reasons() {
+  local -a seen=()
+  local i reason known s
+  ((notes == 0)) && return 0
+  say ""
+  say "${B}Left as notes${Z}"
+  for i in "${!item_kind[@]}"; do
+    [[ "${item_kind[$i]}" == note ]] || continue
+    reason="$(skip_reason "${item_key[$i]}")"
+    known=0
+    if ((${#seen[@]})); then
+      for s in "${seen[@]}"; do
+        [[ "$s" == "$reason" ]] && known=1 && break
+      done
+    fi
+    ((known)) && continue
+    seen+=("$reason")
+    say "  ${reason}"
+  done
+}
+
 review() {
   local include_packages="${1:-yes}"
-  local collected index fixes=0 notes=0
-  local -a fix_title=() fix_detail=() fix_action=()
+  local collected index fixes=0 notes=0 total=0
+  local -a item_kind=() item_key=() item_title=() item_detail=() item_action=()
   index="$(hardening_index || true)"
-  echo
-  echo "${B}Results${Z}"
-  [[ -n "$index" ]] && echo "Lynis hardening index: ${B}${index}${Z}"
-  echo
+  say ""
+  say "${B}Results${Z}"
+  [[ -n "$index" ]] && say "Lynis hardening index: ${B}${index}${Z}"
+  say ""
 
   if [[ "$include_packages" == yes ]]; then
     collected="$( { collect_lynis; collect_packages; } )"
@@ -333,32 +752,41 @@ review() {
     collected="$(collect_lynis)"
   fi
   if [[ -z "$collected" ]]; then
-    echo "No warnings, suggestions, or package advisories."
+    say "No warnings, suggestions, or package advisories."
     return 0
   fi
 
-  local kind key title detail action
+  local kind key title detail action i
   while IFS=$'\t' read -r kind key title detail action; do
     [[ -n "${kind:-}" ]] || continue
+    item_kind+=("$kind")
+    item_key+=("$key")
+    item_title+=("$title")
+    item_detail+=("$detail")
+    item_action+=("$action")
+    total=$((total + 1))
     if [[ "$kind" == fix ]]; then
       fixes=$((fixes + 1))
-      fix_title+=("$title")
-      fix_detail+=("$detail")
-      fix_action+=("$action")
-      printf '%s[fix %d]%s %s\n' "$G" "$fixes" "$Z" "$title"
-      [[ -n "$detail" ]] && printf '         %s\n' "$detail"
     else
       notes=$((notes + 1))
-      printf '%s[note]%s %s\n' "$D" "$Z" "$title"
-      [[ -n "$detail" ]] && printf '        %s%s%s\n' "$D" "$detail" "$Z"
     fi
   done <<<"$collected"
 
-  echo
-  echo "${fixes} automatic fix(es). ${notes} note(s) with no automatic fix."
+  for i in "${!item_kind[@]}"; do
+    [[ "${item_kind[$i]}" == fix ]] || continue
+    say "${G}[fix]${Z} ${item_title[$i]}"
+    [[ -n "${item_detail[$i]}" ]] && say "       ${item_detail[$i]}"
+  done
+  for i in "${!item_kind[@]}"; do
+    [[ "${item_kind[$i]}" == note ]] || continue
+    say "${D}[note]${Z} ${item_title[$i]}"
+    [[ -n "${item_detail[$i]}" ]] && say "${D}       ${item_detail[$i]}${Z}"
+  done
+
+  say ""
+  say "${fixes} automatic fix(es). ${notes} note(s)."
   if ((fixes == 0)); then
-    echo "Nothing in this report has a reviewed automatic fix."
-    return 0
+    say "None of these have a reviewed automatic fix. Y still walks through each one."
   fi
 
   local mode
@@ -366,48 +794,64 @@ review() {
   [[ "$mode" == none ]] && return 0
 
   local -a chosen=()
-  local i reply
+  local reply j
   if [[ "$mode" == all ]]; then
-    echo
-    echo "${B}These fixes will run${Z}"
-    for i in "${!fix_title[@]}"; do
-      printf '  %d. %s\n' "$((i + 1))" "${fix_title[$i]}"
-      [[ -n "${fix_detail[$i]}" ]] && printf '     %s\n' "${fix_detail[$i]}"
+    if ((fixes == 0)); then
+      say "Nothing to apply."
+      return 0
+    fi
+    say ""
+    say "${B}These fixes will run${Z}"
+    for i in "${!item_kind[@]}"; do
+      [[ "${item_kind[$i]}" == fix ]] || continue
+      say "  ${item_title[$i]}"
+      [[ -n "${item_detail[$i]}" ]] && say "    ${item_detail[$i]}"
     done
+    say_note_reasons
+    say ""
     confirm_all "$fixes" || return 0
-    chosen=("${!fix_action[@]}")
+    for i in "${!item_kind[@]}"; do
+      [[ "${item_kind[$i]}" == fix ]] && chosen+=("$i")
+    done
   else
-    for i in "${!fix_title[@]}"; do
-      echo
-      printf '%s[%d/%d]%s %s\n' "$B" "$((i + 1))" "$fixes" "$Z" "${fix_title[$i]}"
-      [[ -n "${fix_detail[$i]}" ]] && printf '%s\n' "${fix_detail[$i]}"
+    for i in "${!item_kind[@]}"; do
+      say ""
+      say "${B}[$((i + 1))/${total}]${Z} ${item_title[$i]}"
+      [[ -n "${item_detail[$i]}" ]] && say "${item_detail[$i]}"
+      if [[ "${item_kind[$i]}" != fix ]]; then
+        say "No automatic fix. $(skip_reason "${item_key[$i]}")"
+        reply="$(ask "[Enter] next, q quit: ")"
+        [[ "${reply,,}" == q || "${reply,,}" == quit ]] && break
+        continue
+      fi
       while true; do
-        read -r -p "Apply this fix? [y]es  [n]o  [a]ll remaining  [q]uit: " reply
+        reply="$(ask "Apply this fix? [y]es  [n]o  [a]ll remaining  [q]uit: ")"
         case "${reply,,}" in
           y|yes) chosen+=("$i"); break ;;
           n|no|"") break ;;
           a|all)
-            local j
-            for ((j = i; j < fixes; j++)); do chosen+=("$j"); done
+            for ((j = i; j < total; j++)); do
+              [[ "${item_kind[$j]}" == fix ]] && chosen+=("$j")
+            done
             break 2
             ;;
           q|quit) break 2 ;;
-          *) echo "Type y, n, a, or q." ;;
+          *) say "Type y, n, a, or q." ;;
         esac
       done
     done
   fi
 
   ((${#chosen[@]})) || return 0
-  echo
+  say ""
   sudo -v || die "sudo is required to apply fixes."
   for i in "${chosen[@]}"; do
-    echo "${B}Applying${Z} ${fix_title[$i]}"
-    if apply_action "${fix_action[$i]}"; then
-      record_applied "${fix_action[$i]}"
-      echo "${G}done${Z}"
+    say "${B}Applying${Z} ${item_title[$i]}"
+    if apply_action "${item_action[$i]}"; then
+      record_applied "${item_action[$i]}"
+      say "${G}done${Z}"
     else
-      echo "${R}failed${Z}: ${fix_title[$i]}" >&2
+      say "${R}failed${Z}: ${item_title[$i]}"
     fi
   done
 }
@@ -420,11 +864,18 @@ Usage: omarchy-lynis-scan
 
 Scan this machine with Lynis, then choose what to fix.
 
-  A  apply every automatic fix, after a confirmation list
+  A  apply every reviewed automatic fix, after a confirmation list
   N  apply nothing
-  Y  ask for each automatic fix
+  Y  ask for each finding. Fixes can be applied. Notes are explained and skipped.
 
-Notes are printed and never changed. A log of applied actions is kept at
+Reviewed fixes include safe sysctl values, blocking dccp, sctp, rds, tipc,
+and firewire storage, a legal /etc/issue banner, the hostname in /etc/hosts,
+core-dump limits, a patched Arch package, NTP, ufw, and other-write under /etc.
+
+USB storage, compilers, password aging, kernel-module lockdown, IP forwarding,
+and advisories with no patched package stay as notes.
+
+A log of applied actions is kept at
 $APPLIED
 EOF
       return 0
