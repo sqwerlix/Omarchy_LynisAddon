@@ -1,6 +1,6 @@
 # Omarchy Lynis addon
 
-Scan this Omarchy machine with Lynis from **Setup → Security → Lynis**, then choose what to fix.
+Scan Omarchy machine with Lynis from **Setup → Security → Lynis**, then choose what to fix.
 
 ## Install
 
